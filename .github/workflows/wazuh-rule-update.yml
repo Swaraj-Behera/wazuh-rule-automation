@@ -11,12 +11,18 @@ on:
         description: 'Rule file name'
         required: true
         default: 'custom_rules.xml'
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        type: boolean
+        default: false
 
 env:
   WAZUH_HOST: ${{ secrets.WAZUH_HOST }}
   WAZUH_USER: ${{ secrets.WAZUH_USER }}
   WAZUH_PASSWORD: ${{ secrets.WAZUH_PASSWORD }}
   WAZUH_PORT: ${{ secrets.WAZUH_PORT || '55000' }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
 jobs:
   rule-update:
@@ -40,7 +46,15 @@ jobs:
       run: |
         mkdir -p backups
         echo "BACKUP_DIR=$(pwd)/backups" >> $GITHUB_ENV
-        
+    
+    - name: Setup SSH key (if provided)
+      if: env.SSH_PRIVATE_KEY != ''
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ env.WAZUH_HOST }} >> ~/.ssh/known_hosts
+    
     - name: Run Wazuh Rule Update
       run: |
         python scripts/update_rules.py \
@@ -48,8 +62,10 @@ jobs:
           --user ${{ env.WAZUH_USER }} \
           --password ${{ env.WAZUH_PASSWORD }} \
           --port ${{ env.WAZUH_PORT }} \
-          --rule-file rules/custom_rules.xml \
-          --backup-dir ${{ env.BACKUP_DIR }}
+          --rule-file ${{ github.event.inputs.rule_file || 'rules/custom_rules.xml' }} \
+          --backup-dir ${{ env.BACKUP_DIR }} \
+          ${{ github.event.inputs.rollback == 'true' && '--rollback' || '' }} \
+          ${{ env.SSH_PRIVATE_KEY != '' && '--ssh-key ~/.ssh/id_rsa' || '' }}
     
     - name: Verify Wazuh Status
       run: |
@@ -71,4 +87,22 @@ jobs:
         name: update-logs-${{ github.run_id }}
         path: |
           *.log
+          *.json
           backup_*.txt
+    
+    - name: Upload summary report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: update-summary-${{ github.run_id }}
+        path: update_summary_*.json
+    
+    - name: Send notification (optional)
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "✅ Wazuh rule update completed successfully!"
+        else
+          echo "❌ Wazuh rule update failed!"
+          # Add your notification logic here (e.g., Slack, email)
+        fi
