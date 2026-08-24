@@ -1,16 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <rules>
-    <group name="custom_rules">
+    <group name="github_automation">
         <rule id="100001" level="5">
             <if_sid>100000</if_sid>
-            <match>custom_pattern</match>
-            <description>Custom rule pattern detected</description>
+            <match>github_automation_test</match>
+            <description>GitHub Automation Test Rule</description>
         </rule>
         
-        <rule id="100002" level="10">
+        <rule id="100002" level="7">
             <if_sid>100001</if_sid>
-            <match>critical_pattern</match>
-            <description>Critical custom rule triggered</description>
+            <match>error|failed</match>
+            <description>Error detected by GitHub automation</description>
+        </rule>
+        
+        <rule id="100003" level="3">
+            <if_sid>100000</if_sid>
+            <match>warning</match>
+            <description>Warning detected by GitHub automation</description>
         </rule>
     </group>
 </rules>
