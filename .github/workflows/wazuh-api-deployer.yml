@@ -1,0 +1,236 @@
+name: Wazuh Rule Deployer (API-Based)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Choose Deployment Mode'
+        required: true
+        default: 'append'
+        type: choice
+        options:
+          - append
+          - overwrite
+  push:
+    branches: [ main ]
+    paths:
+      - 'rules/local_rules.xml'
+      - 'rules/append_rules.xml'
+
+permissions:
+  contents: write
+
+jobs:
+  deploy_wazuh_rules:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Deploy Wazuh Rules via API
+        id: deploy
+        env:
+          WAZUH_API_URL: ${{ secrets.WAZUH_API_URL }}
+          WAZUH_API_USER: ${{ secrets.WAZUH_API_USER }}
+          WAZUH_API_PASSWORD: ${{ secrets.WAZUH_API_PASSWORD }}
+        run: |
+          set -e
+          
+          echo "=== WAZUH RULE DEPLOYMENT STARTED ==="
+          
+          # Determine deployment mode
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ inputs.action_type }}"
+          elif git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -q "rules/local_rules.xml"; then
+            MODE="overwrite"
+          else
+            MODE="append"
+          fi
+          
+          echo "Deployment Mode: $MODE"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "DEPLOY_MODE=$MODE" >> $GITHUB_ENV
+          
+          # -------------------------------------------------------------
+          # Step 1: Authenticate to Wazuh API
+          # -------------------------------------------------------------
+          echo "=== Step 1: Authenticating to Wazuh API ==="
+          echo "API URL: $WAZUH_API_URL"
+          
+          AUTH_RESPONSE=$(curl -s -k -X POST "$WAZUH_API_URL/security/user/authenticate" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$WAZUH_API_USER\",\"password\":\"$WAZUH_API_PASSWORD\"}")
+          
+          # Extract token from response
+          TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.data.token // empty')
+          
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to authenticate with Wazuh API"
+            echo "Response: $AUTH_RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ Authentication successful!"
+          
+          # -------------------------------------------------------------
+          # Step 2: Backup current rules
+          # -------------------------------------------------------------
+          echo "=== Step 2: Backing up current rules ==="
+          mkdir -p history
+          
+          curl -s -k -X GET "$WAZUH_API_URL/rules/files/local_rules.xml" \
+            -H "Authorization: Bearer $TOKEN" \
+            -o "history/${MODE}_pre_${TIMESTAMP}.xml"
+          
+          if [ -f "history/${MODE}_pre_${TIMESTAMP}.xml" ]; then
+            echo "✅ Backup saved to history/${MODE}_pre_${TIMESTAMP}.xml"
+          else
+            echo "⚠️ Warning: Could not backup current rules (may not exist)"
+          fi
+          
+          # -------------------------------------------------------------
+          # Step 3: Apply rules based on mode
+          # -------------------------------------------------------------
+          echo "=== Step 3: Applying rules ($MODE mode) ==="
+          
+          if [ "$MODE" = "overwrite" ]; then
+            echo "Overwriting with: rules/local_rules.xml"
+            
+            # Upload the file
+            curl -f -k -X PUT "$WAZUH_API_URL/rules/files/local_rules.xml?overwrite=true" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@rules/local_rules.xml"
+            
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to upload rules via API"
+              exit 1
+            fi
+            echo "✅ Rules overwritten successfully"
+            
+          else
+            echo "Appending: rules/append_rules.xml"
+            
+            # Get current rules
+            CURRENT_RULES=$(curl -s -k -X GET "$WAZUH_API_URL/rules/files/local_rules.xml" \
+              -H "Authorization: Bearer $TOKEN")
+            
+            # Extract content without group tags (skip empty lines and comments)
+            APPEND_CONTENT=$(grep -v '<group' rules/append_rules.xml | \
+                             grep -v '</group>' | \
+                             grep -v '^[[:space:]]*#' | \
+                             grep -v '^[[:space:]]*$' | \
+                             grep -v '<?xml' || true)
+            
+            # Build merged XML
+            if [ -z "$CURRENT_RULES" ] || [ "$CURRENT_RULES" = "null" ]; then
+              # No current rules, create new
+              MERGED_XML='<?xml version="1.0" encoding="UTF-8"?>\n<group name="local,syslog,sshd,">\n'
+              MERGED_XML="${MERGED_XML}${APPEND_CONTENT}\n</group>"
+            else
+              # Merge with existing
+              MERGED_XML=$(echo "$CURRENT_RULES" | sed '/<\/group>/d')
+              MERGED_XML="${MERGED_XML}\n${APPEND_CONTENT}\n</group>"
+            fi
+            
+            # Save merged file
+            echo -e "$MERGED_XML" > /tmp/merged_rules.xml
+            
+            # Upload merged file
+            curl -f -k -X PUT "$WAZUH_API_URL/rules/files/local_rules.xml?overwrite=true" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@/tmp/merged_rules.xml"
+            
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to upload merged rules via API"
+              exit 1
+            fi
+            echo "✅ Rules appended successfully"
+          fi
+          
+          # -------------------------------------------------------------
+          # Step 4: Validate rules
+          # -------------------------------------------------------------
+          echo "=== Step 4: Validating rules ==="
+          
+          VALIDATION=$(curl -s -k -X POST "$WAZUH_API_URL/manager/validation" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"validation_type":"rules"}')
+          
+          VALID=$(echo "$VALIDATION" | jq -r '.data.valid // false')
+          ERRORS=$(echo "$VALIDATION" | jq -r '.data.errors // ""')
+          
+          if [ "$VALID" != "true" ]; then
+            echo "::error::Rule validation failed!"
+            echo "Errors: $ERRORS"
+            echo "Full response: $VALIDATION"
+            exit 1
+          fi
+          echo "✅ Rules validated successfully"
+          
+          # -------------------------------------------------------------
+          # Step 5: Restart Wazuh Manager
+          # -------------------------------------------------------------
+          echo "=== Step 5: Restarting Wazuh Manager ==="
+          
+          RESTART_RESPONSE=$(curl -s -k -X PUT "$WAZUH_API_URL/manager/restart" \
+            -H "Authorization: Bearer $TOKEN")
+          
+          RESTART_STATUS=$(echo "$RESTART_RESPONSE" | jq -r '.data.status // "failed"')
+          
+          if [ "$RESTART_STATUS" != "success" ] && [ "$RESTART_STATUS" != "restarting" ]; then
+            echo "::error::Failed to restart Wazuh Manager"
+            echo "Response: $RESTART_RESPONSE"
+            exit 1
+          fi
+          echo "✅ Restart initiated successfully"
+          
+          # -------------------------------------------------------------
+          # Step 6: Health Check
+          # -------------------------------------------------------------
+          echo "=== Step 6: Performing health check ==="
+          sleep 10
+          
+          HEALTH_RESPONSE=$(curl -s -k -X GET "$WAZUH_API_URL/manager/status" \
+            -H "Authorization: Bearer $TOKEN")
+          
+          # Check if Wazuh is running
+          STATUS=$(echo "$HEALTH_RESPONSE" | jq -r '.data.manager_status // .data.status // "unknown"')
+          
+          echo "Wazuh Status: $STATUS"
+          
+          if [[ "$STATUS" != *"running"* ]] && [[ "$STATUS" != *"started"* ]]; then
+            echo "::error::Health check failed! Wazuh Manager is not running properly."
+            echo "Status: $STATUS"
+            echo "Full response: $HEALTH_RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ Wazuh Manager is running normally"
+          echo "=== DEPLOYMENT SUCCESSFUL ==="
+
+      - name: Commit & Push History Backup
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase || true
+          git add history/
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto-Archive: ${DEPLOY_MODE}_pre_${TIMESTAMP}.xml [skip ci]"
+            git push https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git HEAD:main
+            echo "✅ Backup pushed to GitHub history folder!"
+          else
+            echo "No new changes to commit to history."
+          fi
