@@ -1,0 +1,81 @@
+name: Wazuh Rule Automation
+
+on:
+  push:
+    paths:
+      - 'rules/**/*.xml'
+  workflow_dispatch:
+    inputs:
+      rule_file:
+        description: 'Rule file to upload'
+        required: false
+        default: 'rules/custom_rules.xml'
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  WAZUH_HOST: ${{ secrets.WAZUH_HOST }}
+  WAZUH_PORT: ${{ secrets.WAZUH_PORT }}
+  WAZUH_USER: ${{ secrets.WAZUH_USER }}
+  WAZUH_PASSWORD: ${{ secrets.WAZUH_PASSWORD }}
+
+jobs:
+  update-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: pip install requests
+    
+    - name: Create backup directory
+      run: mkdir -p backups
+    
+    - name: Test API Connection
+      run: |
+        echo "Testing API connection to $WAZUH_HOST:$WAZUH_PORT..."
+        curl -k -v --connect-timeout 10 https://$WAZUH_HOST:$WAZUH_PORT/ || echo "Connection test completed"
+    
+    - name: Run Wazuh Rule Update
+      run: |
+        python scripts/update_rules.py \
+          --host "$WAZUH_HOST" \
+          --port "$WAZUH_PORT" \
+          --user "$WAZUH_USER" \
+          --password "$WAZUH_PASSWORD" \
+          --rule-file "${{ github.event.inputs.rule_file || 'rules/custom_rules.xml' }}" \
+          --backup-dir ./backups \
+          ${{ github.event.inputs.rollback == 'true' && '--rollback' || '' }}
+    
+    - name: Verify Wazuh Status
+      run: |
+        python scripts/verify_wazuh.py \
+          --host "$WAZUH_HOST" \
+          --port "$WAZUH_PORT"
+    
+    - name: Upload backup artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: wazuh-backups-${{ github.run_id }}
+        path: backups/
+    
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: wazuh-logs-${{ github.run_id }}
+        path: |
+          *.log
+          *.json
