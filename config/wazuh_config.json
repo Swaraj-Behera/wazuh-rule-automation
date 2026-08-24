@@ -1,0 +1,17 @@
+{
+  "wazuh": {
+    "api": {
+      "host": "your-wazuh-server.com",
+      "port": 55000,
+      "user": "wazuh-api-user",
+      "password": "your-secure-password"
+    },
+    "rules_path": "/var/ossec/etc/rules/"
+  },
+  "automation": {
+    "backup_enabled": true,
+    "backup_retention_days": 30,
+    "verify_after_restart": true,
+    "restart_timeout_seconds": 120
+  }
+}
